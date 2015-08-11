@@ -1,220 +1,202 @@
-#include <linux/buffer_head.h>
-#include <linux/fs.h>
-#include <linux/init.h>
 #include <linux/module.h>
-#include <linux/slab.h>
+#include <linux/fs.h>
+#include <linux/pagemap.h>
+#include <linux/mount.h>
+#include <linux/init.h>
+#include <linux/namei.h>
 
-#include "aufs.h"
+#define AUFS_MAGIC 0x64668735
 
-static void aufs_put_super(struct super_block *sb)
+static struct vfsmount *aufs_mount;
+static int aufs_mount_count;
+
+static struct inode *aufs_get_inode(struct super_block *sb, int mode, dev_t dev)
 {
-	struct aufs_super_block *asb = AUFS_SB(sb);
+  struct inode *inode = new_inode(sb);
 
-	if (asb)
-		kfree(asb);
-	sb->s_fs_info = NULL;
-	pr_debug("aufs super block destroyed\n");
+  if (inode) {
+       inode->i_mode = mode;
+       inode->i_uid = current->fsuid;
+       inode->i_gid = current->fsgid;
+       //inode->i_blksize = PAGE_CACHE_SIZE;
+       inode->i_blocks = 0;
+       inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
+       switch (mode & S_IFMT) {
+       default:
+           init_special_inode(inode, mode, dev);
+           break;
+       case S_IFREG:
+           printk("creat a  file \n");
+           break;
+       case S_IFDIR:
+           inode->i_op = &simple_dir_inode_operations;
+           inode->i_fop = &simple_dir_operations;
+           printk("creat a dir file \n");
+ 
+           inode->i_nlink++;
+           break;
+       }
+  }
+  return inode;
+}
+/* SMP-safe */
+static int aufs_mknod(struct inode *dir, struct dentry *dentry,
+           int mode, dev_t dev)
+{
+  struct inode *inode;
+  int error = -EPERM;
+
+  if (dentry->d_inode)
+       return -EEXIST;
+
+  inode = aufs_get_inode(dir->i_sb, mode, dev);
+  if (inode) {
+       d_instantiate(dentry, inode);
+       dget(dentry);
+       error = 0;
+  }
+  return error;
 }
 
-static struct super_operations const aufs_super_ops = {
-	.alloc_inode = aufs_inode_alloc,
-	.destroy_inode = aufs_inode_free,
-	.put_super = aufs_put_super,
+static int aufs_mkdir(struct inode *dir, struct dentry *dentry, int mode)
+{
+  int res;
+
+  res = aufs_mknod(dir, dentry, mode |S_IFDIR, 0);
+  if (!res)
+       dir->i_nlink++;
+  return res;
+}
+
+static int aufs_create(struct inode *dir, struct dentry *dentry, int mode)
+{
+  return aufs_mknod(dir, dentry, mode | S_IFREG, 0);
+}
+
+static int aufs_fill_super(struct super_block *sb, void *data, int silent)
+{
+  static struct tree_descr debug_files[] = {{""}};
+
+  return simple_fill_super(sb, AUFS_MAGIC, debug_files);
+}
+
+static int aufs_get_sb(struct file_system_type *fs_type,
+       int flags, const char *dev_name,
+       void *data)
+{
+  return get_sb_single(fs_type, flags, data, aufs_fill_super, aufs_mount);
+}
+
+static struct file_system_type au_fs_type = {
+  .owner =    THIS_MODULE,
+  .name =     "aufs",
+  .get_sb =   aufs_get_sb,
+  .kill_sb =  kill_litter_super,
 };
 
-static inline void aufs_super_block_fill(struct aufs_super_block *asb,
-			struct aufs_disk_super_block const *dsb)
+static int aufs_create_by_name(const char *name, mode_t mode,
+                 struct dentry *parent,
+                 struct dentry **dentry)
 {
-	asb->asb_magic = be32_to_cpu(dsb->dsb_magic);
-	asb->asb_inode_blocks = be32_to_cpu(dsb->dsb_inode_blocks);
-	asb->asb_block_size = be32_to_cpu(dsb->dsb_block_size);
-	asb->asb_root_inode = be32_to_cpu(dsb->dsb_root_inode);
-	asb->asb_inodes_in_block =
-		asb->asb_block_size / sizeof(struct aufs_disk_inode);
+  int error = 0;
+
+  /* If the parent is not specified, we create it in the root.
+   * We need the root dentry to do this, which is in the super
+   * block. A pointer to that is in the struct vfsmount that we
+   * have around.
+   */
+  if (!parent ) {
+       if (aufs_mount && aufs_mount->mnt_sb) {
+           parent = aufs_mount->mnt_sb->s_root;
+       }
+  }
+  if (!parent) {
+       printk("Ah! can not find a parent!\n");
+       return -EFAULT;
+  }
+
+  *dentry = NULL;
+  mutex_lock(&parent->d_inode->i_mutex);
+  *dentry = lookup_one_len(name, parent, strlen(name));
+  if (!IS_ERR(dentry)) {
+       if ((mode & S_IFMT) == S_IFDIR)
+            error = aufs_mkdir(parent->d_inode, *dentry, mode);
+       else
+            error = aufs_create(parent->d_inode, *dentry, mode);
+  } else
+       error = PTR_ERR(dentry);
+  mutex_unlock(&parent->d_inode->i_mutex);
+
+  return error;
 }
 
-static struct aufs_super_block *aufs_super_block_read(struct super_block *sb)
+struct dentry *aufs_create_file(const char *name, mode_t mode,
+                  struct dentry *parent, void *data,
+                  struct file_operations *fops)
 {
-	struct aufs_super_block *asb = (struct aufs_super_block *)
-			kzalloc(sizeof(struct aufs_super_block), GFP_NOFS);
-	struct aufs_disk_super_block *dsb;
-	struct buffer_head *bh;
+  struct dentry *dentry = NULL;
+  int error;
 
-	if (!asb) {
-		pr_err("aufs cannot allocate super block\n");
-		return NULL;
-	}
+  printk("aufs: creating file '%s'\n",name);
 
-	bh = sb_bread(sb, 0);
-	if (!bh) {
-		pr_err("cannot read 0 block\n");
-		goto free_memory;
-	}
-
-	dsb = (struct aufs_disk_super_block *)bh->b_data;
-	aufs_super_block_fill(asb, dsb);
-	brelse(bh);
-
-	if (asb->asb_magic != AUFS_MAGIC) {
-		pr_err("wrong magic number %lu\n",
-			(unsigned long)asb->asb_magic);
-		goto free_memory;
-	}
-
-	pr_debug("aufs super block info:\n"
-		"\tmagic           = %lu\n"
-		"\tinode blocks    = %lu\n"
-		"\tblock size      = %lu\n"
-		"\troot inode      = %lu\n"
-		"\tinodes in block = %lu\n",
-		(unsigned long)asb->asb_magic,
-		(unsigned long)asb->asb_inode_blocks,
-		(unsigned long)asb->asb_block_size,
-		(unsigned long)asb->asb_root_inode,
-		(unsigned long)asb->asb_inodes_in_block);
-
-	return asb;
-
-free_memory:
-	kfree(asb);
-	return NULL;
+  error = aufs_create_by_name(name, mode, parent, &dentry);
+  if (error) {
+       dentry = NULL;
+       goto exit;
+  }
+  if (dentry->d_inode) {
+       //if (data)
+       //     dentry->d_inode->u.generic_ip = data;
+       if (fops)
+            dentry->d_inode->i_fop = fops;
+  }
+exit:
+  return dentry;
 }
-
-static int aufs_fill_sb(struct super_block *sb, void *data, int silent)
+ 
+struct dentry *aufs_create_dir(const char *name, struct dentry *parent)
 {
-	struct aufs_super_block *asb = aufs_super_block_read(sb);
-	struct inode *root;
-
-	if (!asb)
-		return -EINVAL;
-
-	sb->s_magic = asb->asb_magic;
-	sb->s_fs_info = asb;
-	sb->s_op = &aufs_super_ops;
-
-	if (sb_set_blocksize(sb, asb->asb_block_size) == 0) {
-		pr_err("device does not support block size %lu\n",
-			(unsigned long)asb->asb_block_size);
-		return -EINVAL;
-	}
-
-	root = aufs_inode_get(sb, asb->asb_root_inode);
-	if (IS_ERR(root))
-		return PTR_ERR(root);
-
-	sb->s_root = d_make_root(root);
-	if (!sb->s_root) {
-		pr_err("aufs cannot create root\n");
-		return -ENOMEM;
-	}
-
-	return 0;
-}
-
-static struct dentry *aufs_mount(struct file_system_type *type, int flags,
-			char const *dev, void *data)
-{
-	struct dentry *entry = mount_bdev(type, flags, dev, data, aufs_fill_sb);
-
-	if (IS_ERR(entry))
-		pr_err("aufs mounting failed\n");
-	else
-		pr_debug("aufs mounted\n");
-	return entry;
-}
-
-static struct file_system_type aufs_type = {
-	.owner = THIS_MODULE,
-	.name = "aufs",
-	.mount = aufs_mount,
-	.kill_sb = kill_block_super,
-	.fs_flags = FS_REQUIRES_DEV
-};
-
-static struct kmem_cache *aufs_inode_cache;
-
-struct inode *aufs_inode_alloc(struct super_block *sb)
-{
-	struct aufs_inode *inode = (struct aufs_inode *)
-				kmem_cache_alloc(aufs_inode_cache, GFP_KERNEL);
-
-	if (!inode)
-		return NULL;
-	return &inode->ai_inode;
-}
-
-static void aufs_free_callback(struct rcu_head *head)
-{
-	struct inode *inode = container_of(head, struct inode, i_rcu);
-
-	pr_debug("freeing inode %lu\n", (unsigned long)inode->i_ino);
-	kmem_cache_free(aufs_inode_cache, AUFS_INODE(inode));
-}
-
-void aufs_inode_free(struct inode *inode)
-{
-	call_rcu(&inode->i_rcu, aufs_free_callback);
-}
-
-static void aufs_inode_init_once(void *i)
-{
-	struct aufs_inode *inode = (struct aufs_inode *)i;
-
-	inode_init_once(&inode->ai_inode);
-}
-
-static int aufs_inode_cache_create(void)
-{
-	aufs_inode_cache = kmem_cache_create("aufs_inode",
-		sizeof(struct aufs_inode), 0,
-		(SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD), aufs_inode_init_once);
-	if (aufs_inode_cache == NULL)
-		return -ENOMEM;
-	return 0;
-}
-
-static void aufs_inode_cache_destroy(void)
-{
-	rcu_barrier();
-	kmem_cache_destroy(aufs_inode_cache);
-	aufs_inode_cache = NULL;
+  return aufs_create_file(name,
+                  S_IFDIR | S_IRWXU | S_IRUGO | S_IXUGO,
+                  parent, NULL, NULL);
 }
 
 static int __init aufs_init(void)
 {
-	int ret = aufs_inode_cache_create();
+  int retval;
+       struct dentry *pslot;
+  
+  retval = register_filesystem(&au_fs_type);
 
-	if (ret != 0) {
-		pr_err("cannot create inode cache\n");
-		return ret;
-	}
+  if (!retval) {
+       aufs_mount = kern_mount(&au_fs_type);
+       if (IS_ERR(aufs_mount)) {
+           printk(KERN_ERR "aufs: could not mount!\n");
+           unregister_filesystem(&au_fs_type);
+           return retval;
+       }
+  }
+/* 
+  pslot = aufs_create_dir("woman star",NULL);
+  aufs_create_file("lbb", S_IFREG | S_IRUGO, pslot, NULL, NULL); 
+  aufs_create_file("fbb", S_IFREG | S_IRUGO, pslot, NULL, NULL);
+  aufs_create_file("ljl", S_IFREG | S_IRUGO, pslot, NULL, NULL); 
 
-	ret = register_filesystem(&aufs_type);
-	if (ret != 0) {
-		aufs_inode_cache_destroy();
-		pr_err("cannot register filesystem\n");
-		return ret;
-	}
-
-	pr_debug("aufs module loaded\n");
-
-	return 0;
+  pslot = aufs_create_dir("man star",NULL);  
+  aufs_create_file("ldh", S_IFREG | S_IRUGO, pslot, NULL, NULL); 
+  aufs_create_file("lcw", S_IFREG | S_IRUGO, pslot, NULL, NULL);  
+  aufs_create_file("jw", S_IFREG | S_IRUGO, pslot, NULL, NULL);
+  */
+  return retval;
 }
-
-static void __exit aufs_fini(void)
+static void __exit aufs_exit(void)
 {
-	int ret = unregister_filesystem(&aufs_type);
-
-	if (ret != 0)
-		pr_err("cannot unregister filesystem\n");
-
-	aufs_inode_cache_destroy();
-
-	pr_debug("aufs module unloaded\n");
+  simple_release_fs(&aufs_mount, &aufs_mount_count);
+  unregister_filesystem(&au_fs_type);
 }
 
 module_init(aufs_init);
-module_exit(aufs_fini);
-
+module_exit(aufs_exit);
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("kmu");
+MODULE_DESCRIPTION("This is a simple module");
+MODULE_VERSION("Ver 0.1");
